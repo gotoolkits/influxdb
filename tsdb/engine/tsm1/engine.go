@@ -625,9 +625,6 @@ func (e *Engine) backup(w io.Writer, basePath string, since time.Time, compType 
 		return err
 	}
 
-	tw := tar.NewWriter(w)
-	defer tw.Close()
-
 	// Remove the temporary snapshot dir
 	defer os.RemoveAll(path)
 
@@ -652,17 +649,23 @@ func (e *Engine) backup(w io.Writer, basePath string, since time.Time, compType 
 		return nil
 	}
 
-	for _, f := range filtered {
-		if compType == "tar" {
+	if compType == "tar" {
+		tw := tar.NewWriter(w)
+		defer tw.Close()
+		for _, f := range filtered {
 			if err := e.writeFileToBackup(f, basePath, filepath.Join(path, f), tw); err != nil {
 				return err
 			}
-		} else {
-			if err := e.writeFileToGzip(f, basePath, filepath.Join(path, f), tw); err != nil {
+		}
+	} else {
+		zw := gzip.NewWriter(w)
+		// see note below why there's no zw.Close()
+		for _, f := range filtered {
+			if err := e.writeFileToGzip(f, basePath, filepath.Join(path, f), zw); err != nil {
 				return err
 			}
+			zw.Reset(w)
 		}
-
 	}
 
 	return nil
@@ -854,7 +857,7 @@ func (e *Engine) writeFileToGzip(name string, shardRelativePath, fullPath string
 // Only files that match basePath will be copied into the directory. This obtains
 // a write lock so no operations can be performed while restoring.
 func (e *Engine) Restore(r io.Reader, basePath string) error {
-	newFiles, err := e.getFilesTar(r)
+	newFiles, err := e.getFilesTar(r, basePath, false)
 	if err != nil {
 		return err
 	}
@@ -865,14 +868,14 @@ func (e *Engine) Restore(r io.Reader, basePath string) error {
 // file matching basePath as a new TSM file.  This obtains
 // a write lock so no operations can be performed while Importing.
 func (e *Engine) Import(r io.Reader, basePath string) error {
-	newFiles, err := e.getFilesTar(r)
+	newFiles, err := e.getFilesTar(r, basePath, true)
 	if err != nil {
 		return err
 	}
 	return e.overlay(r, basePath, true, newFiles)
 }
 
-func (e *Engine) getFilesTar(r io.Reader) ([]string, error) {
+func (e *Engine) getFilesTar(r io.Reader, basePath string, asNew bool) ([]string, error) {
 	var newFiles []string
 	tr := tar.NewReader(r)
 	for {

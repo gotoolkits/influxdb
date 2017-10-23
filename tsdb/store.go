@@ -780,7 +780,7 @@ func (s *Store) BackupShard(id uint64, since time.Time, w io.Writer) error {
 		return err
 	}
 
-	return shard.Backup(w, path, since)
+	return shard.BackupGzip(w, path, since)
 }
 
 func (s *Store) ExportShard(id uint64, start time.Time, end time.Time, w io.Writer) error {

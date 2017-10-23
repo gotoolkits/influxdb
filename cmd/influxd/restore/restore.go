@@ -189,7 +189,9 @@ func (cmd *Command) unpackMeta() error {
 	fmt.Println(metaBytes)
 
 	resp, err := cmd.upload(req, bytes.NewReader(metaBytes), int64(length))
-
+	if err != nil {
+		return err
+	}
 	header := binary.BigEndian.Uint64(resp[:8])
 	npairs := binary.BigEndian.Uint64(resp[8:16])
 	pairs := resp[16:]
