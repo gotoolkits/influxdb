@@ -17,6 +17,7 @@ import (
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/pkg/errors"
 	"github.com/uber-go/zap"
+	"io"
 )
 
 const (
@@ -134,42 +135,53 @@ func (s *Service) handleConn(conn net.Conn) error {
 		return s.writeRetentionPolicyInfo(conn, r.Database, r.RetentionPolicy)
 
 	case RequestMetaStoreUpdate:
-		fmt.Println("!!!!!!!! updating metastore")
-		return updateMetaStore(conn, bytes)
+
+		return s.updateMetaStore(conn, bytes, r.Database, r.RetentionPolicy)
 	default:
 		return fmt.Errorf("request type unknown: %v", r.Type)
 	}
 
 	return nil
 }
-func updateMetaStore(conn net.Conn, bits []byte) error {
+func (s *Service) updateMetaStore(conn net.Conn, bits []byte, newDBName, newRPName string) error {
 
-	//bits := make([]byte, request.UploadSize)
-	//n, err := conn.Read(bits)
+	fmt.Println("!!!!! working on the metastore")
+	md := meta.Data{}
+	err := md.UnmarshalBinary(bits)
+	if err != nil {
+		return fmt.Errorf("failed to decode meta: %s", err)
+	}
 
-	//if err != nil {
-	//	return err
-	//}
+	data := s.MetaClient.(*meta.Client).Data()
+	fmt.Println(data)
+	IDMap, err := data.ImportData(md, newDBName, newRPName)
+	if err != nil {
+		return err
+	}
 
-	var numBytes [16]byte
+	fmt.Println(data)
+	fmt.Println(IDMap)
+	err = s.MetaClient.(*meta.Client).SetData(&data)
+
+	npairs := len(IDMap)
+	// 2 information ints, then npairs of 8byte ints.
+	numBytes := make([]byte, (npairs+1)*16)
+
 	binary.BigEndian.PutUint64(numBytes[:8], BackupMagicHeader)
-	binary.BigEndian.PutUint64(numBytes[8:16], uint64(len(bits)))
-
-	fmt.Printf("!!!!!!!! writing %d bytes back", len(bits))
+	binary.BigEndian.PutUint64(numBytes[8:16], uint64(npairs))
+	next := 16
+	for k, v := range IDMap {
+		binary.BigEndian.PutUint64(numBytes[next:next+8], k)
+		binary.BigEndian.PutUint64(numBytes[next+8:next+16], v)
+		next += 16
+	}
+	fmt.Printf("!!!!!!!! writing %d bytes back", len(numBytes))
+	fmt.Printf("shard id map %v", IDMap)
 	if _, err := conn.Write(numBytes[:]); err != nil {
 		return err
 	}
 
-	md := meta.Data{}
-	err := md.UnmarshalBinary(bits)
-	if err != nil {
-		fmt.Printf("failed to decode meta: %s", err)
-		return err
-	}
-
-	fmt.Printf("decoded meta: %v", md)
-
-	return nil
+	return err
 }
 
 func (s *Service) writeMetaStore(conn net.Conn, dbName string) error {
@@ -186,6 +198,9 @@ func (s *Service) writeMetaStore(conn net.Conn, dbName string) error {
 			return errors.Errorf("Database %s not found.", dbName)
 		}
 		data.Databases = []meta.DatabaseInfo{*keepDB}
+		// drop all users, since we only want the DB
+		data.Users = []meta.UserInfo{}
+
 	}
 	metaBlob, err := data.MarshalBinary()
 
@@ -311,26 +326,35 @@ func (s *Service) readRequest(conn net.Conn) (Request, []byte, error) {
 		return r, []byte{}, err
 	}
 
-	bits := make([]byte, r.UploadSize)
-	fmt.Printf("len bits: %d", len(bits))
+	bits := make([]byte, r.UploadSize+1)
 
-	fmt.Printf("upload size: %d\n", r.UploadSize)
 	if r.UploadSize > 0 {
 
-		d.Buffered().Read(bits)
+		remainder := d.Buffered()
 
-		n, err := d.Buffered().Read(bits)
+		//// no time to investigate.  It seems the JSON encoder puts one extra byte on the stream,
+		//// but the decoder does not consume it.  so we eat a byte here and then everything works.
+		//onebyte := bufio.NewReader(remainder)
+		//_, err := onebyte.ReadByte()
+		//if err != nil {
+		//	return r, bits, err
+		//}
 
-		fmt.Printf("read %d bytes\n", n)
-
-		n, err = conn.Read(bits[n:])
-
-		fmt.Printf("read %d bytes\n", n)
-
-		if err != nil {
+		n, err := remainder.Read(bits)
+		if err != nil && err != io.EOF {
 			return r, bits, err
 		}
 
+		// it is a bit random but sometimes the Json decoder will consume all the bytes and sometimes
+		// it will leave a few behind.
+		if n < int(r.UploadSize+1) {
+			n, err = conn.Read(bits[n:])
+		}
+
+		if err != nil && err != io.EOF {
+			return r, bits, err
+		}
+		return r, bits[1:], nil
 	}
 
 	return r, bits, nil
