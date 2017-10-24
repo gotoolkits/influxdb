@@ -609,13 +609,6 @@ func (e *Engine) Free() error {
 // backup is running. For shards that are still acively getting writes, this
 // could cause the WAL to backup, increasing memory usage and evenutally rejecting writes.
 func (e *Engine) Backup(w io.Writer, basePath string, since time.Time) error {
-	return e.backup(w, basePath, since, "tar")
-}
-
-func (e *Engine) BackupGzip(w io.Writer, basePath string, since time.Time) error {
-	return e.backup(w, basePath, since, "gzip")
-}
-func (e *Engine) backup(w io.Writer, basePath string, since time.Time, compType string) error {
 	path, err := e.CreateSnapshot()
 	if err != nil {
 		return err
@@ -624,6 +617,9 @@ func (e *Engine) backup(w io.Writer, basePath string, since time.Time, compType 
 	if err := e.index.SnapshotTo(path); err != nil {
 		return err
 	}
+
+	tw := tar.NewWriter(w)
+	defer tw.Close()
 
 	// Remove the temporary snapshot dir
 	defer os.RemoveAll(path)
@@ -649,22 +645,9 @@ func (e *Engine) backup(w io.Writer, basePath string, since time.Time, compType 
 		return nil
 	}
 
-	if compType == "tar" {
-		tw := tar.NewWriter(w)
-		defer tw.Close()
-		for _, f := range filtered {
-			if err := e.writeFileToBackup(f, basePath, filepath.Join(path, f), tw); err != nil {
-				return err
-			}
-		}
-	} else {
-		zw := gzip.NewWriter(w)
-		// see note below why there's no zw.Close()
-		for _, f := range filtered {
-			if err := e.writeFileToGzip(f, basePath, filepath.Join(path, f), zw); err != nil {
-				return err
-			}
-			zw.Reset(w)
+	for _, f := range filtered {
+		if err := e.writeFileToBackup(f, basePath, filepath.Join(path, f), tw); err != nil {
+			return err
 		}
 	}
 
@@ -683,10 +666,8 @@ func (e *Engine) Export(w io.Writer, basePath string, start time.Time, end time.
 		return err
 	}
 
-	zw := gzip.NewWriter(w)
-	// used to have a defer zw.Close() here, but combined with the call to reset below, that was
-	// making it look like there was one extra file on the stream.  Test code for the gzip lib
-	// behaves similarly: https://golang.org/src/compress/gzip/example_test.go
+	tw := tar.NewWriter(w)
+	defer tw.Close()
 
 	// Recursively read all files from path.
 	files, err := readDir(path, "")
@@ -719,7 +700,8 @@ func (e *Engine) Export(w io.Writer, basePath string, start time.Time, end time.
 		// We overlap time ranges, we need to filter the file
 		if min >= start.UnixNano() && min <= end.UnixNano() ||
 			max >= start.UnixNano() && max <= end.UnixNano() {
-			if err := e.filterFileToGzip(r, file, basePath, filepath.Join(path, file), start.UnixNano(), end.UnixNano(), zw); err != nil {
+			err := e.filterFileToBackup(r, file, basePath, filepath.Join(path, file), start.UnixNano(), end.UnixNano(), tw)
+			if err != nil {
 				return err
 			}
 
@@ -730,43 +712,32 @@ func (e *Engine) Export(w io.Writer, basePath string, start time.Time, end time.
 
 		// the TSM file is 100% inside the range, so we can just write it without scanning each block
 		if min > start.UnixNano() && max < end.UnixNano() {
-			if err := e.writeFileToGzip(file, basePath, filepath.Join(path, file), zw); err != nil {
+			if err := e.writeFileToBackup(file, basePath, filepath.Join(path, file), tw); err != nil {
 				return err
 			}
 		}
 
 		// if this TSM file had a tombstone we'll write out the whole thing too.
 		if tombstonePath != "" {
-			if err := e.writeFileToGzip(tombstonePath, basePath, filepath.Join(path, tombstonePath), zw); err != nil {
+			if err := e.writeFileToBackup(tombstonePath, basePath, filepath.Join(path, tombstonePath), tw); err != nil {
 				return err
 			}
 		}
-		// when writing a file to Gzip, zw.Close() is how you signify you are done writing the file.
-		// so the helper functions will do the closing.
-		// to write the next file to the gzip stream, we just reset the gzip writer.
-		// later, this zipped stream must be read with zr.Multistream(false) so that it will stop reading on each new file.
-		zw.Reset(w)
+
 	}
 
 	return nil
 }
 
-func (e *Engine) filterFileToGzip(r *TSMReader, name, shardRelativePath, fullPath string, start, end int64, zw *gzip.Writer) error {
-	f, err := os.Stat(fullPath)
+func (e *Engine) filterFileToBackup(r *TSMReader, name, shardRelativePath, fullPath string, start, end int64, tw *tar.Writer) error {
+	path := fullPath + ".tmp"
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(path)
 
-	zw.Name = filepath.ToSlash(filepath.Join(shardRelativePath, name))
-	zw.ModTime = f.ModTime()
-
-	fr, err := os.Open(fullPath)
-	if err != nil {
-		return err
-	}
-	defer fr.Close()
-
-	w, err := NewTSMWriter(zw)
+	w, err := NewTSMWriter(out)
 	if err != nil {
 		return err
 	}
@@ -796,7 +767,7 @@ func (e *Engine) filterFileToGzip(r *TSMReader, name, shardRelativePath, fullPat
 		return err
 	}
 
-	return err
+	return e.writeFileToBackup(path, shardRelativePath, fullPath, tw)
 }
 
 // writeFileToBackup copies the file into the tar archive. Files will use the shardRelativePath
@@ -857,48 +828,37 @@ func (e *Engine) writeFileToGzip(name string, shardRelativePath, fullPath string
 // Only files that match basePath will be copied into the directory. This obtains
 // a write lock so no operations can be performed while restoring.
 func (e *Engine) Restore(r io.Reader, basePath string) error {
-	newFiles, err := e.getFilesTar(r, basePath, false)
-	if err != nil {
-		return err
-	}
-	return e.overlay(r, basePath, false, newFiles)
+	return e.overlay(r, basePath, false)
 }
 
 // Import reads a tar archive generated by Backup() and adds each
 // file matching basePath as a new TSM file.  This obtains
 // a write lock so no operations can be performed while Importing.
 func (e *Engine) Import(r io.Reader, basePath string) error {
-	newFiles, err := e.getFilesTar(r, basePath, true)
-	if err != nil {
-		return err
-	}
-	return e.overlay(r, basePath, true, newFiles)
-}
-
-func (e *Engine) getFilesTar(r io.Reader, basePath string, asNew bool) ([]string, error) {
-	var newFiles []string
-	tr := tar.NewReader(r)
-	for {
-		if fileName, err := e.readFileFromBackup(tr, basePath, asNew); err == io.EOF {
-			break
-		} else if err != nil {
-			return []string{}, err
-		} else if fileName != "" {
-			newFiles = append(newFiles, fileName)
-		}
-	}
-	return newFiles, nil
+	return e.overlay(r, basePath, true)
 }
 
 // overlay reads a tar archive generated by Backup() and adds each file
 // from the archive matching basePath to the shard.
 // If asNew is true, each file will be installed as a new TSM file even if an
 // existing file with the same name in the backup exists.
-func (e *Engine) overlay(r io.Reader, basePath string, asNew bool, newFiles []string) error {
+func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 	// Copy files from archive while under lock to prevent reopening.
 	newFiles, err := func() ([]string, error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
+
+		var newFiles []string
+		tr := tar.NewReader(r)
+		for {
+			if fileName, err := e.readFileFromBackup(tr, basePath, asNew); err == io.EOF {
+				break
+			} else if err != nil {
+				return nil, err
+			} else if fileName != "" {
+				newFiles = append(newFiles, fileName)
+			}
+		}
 
 		if err := syncDir(e.path); err != nil {
 			return nil, err

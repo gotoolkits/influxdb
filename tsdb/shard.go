@@ -1047,14 +1047,6 @@ func (s *Shard) expandSources(sources influxql.Sources) (influxql.Sources, error
 	return expanded, nil
 }
 
-func (s *Shard) BackupGzip(w io.Writer, basePath string, since time.Time) error {
-	engine, err := s.engine()
-	if err != nil {
-		return err
-	}
-	return engine.BackupGzip(w, basePath, since)
-}
-
 // Backup backs up the shard by creating a tar archive of all TSM files that
 // have been modified since the provided time. See Engine.Backup for more details.
 func (s *Shard) Backup(w io.Writer, basePath string, since time.Time) error {
